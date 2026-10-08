@@ -84,6 +84,7 @@ class HuggingFaceDatasetWriter(ParquetWriter):
             save_media_bytes=save_media_bytes,
         )
         self.operations = []
+        self._pending_uploads: dict[str, None] = {}
         self._repo_init = False
         self.revision = revision
 
@@ -97,6 +98,7 @@ class HuggingFaceDatasetWriter(ParquetWriter):
         """Give a copied or deserialized writer independent temporary staging."""
         temporary = state.pop("_local_working_tmpdir", None)
         self.__dict__.update(state)
+        self.__dict__.setdefault("_pending_uploads", {})
         self._local_working_tmpdir = tempfile.TemporaryDirectory() if temporary else None
         self._temporary_staging_closed = False
         if self._local_working_tmpdir is not None:
@@ -120,7 +122,13 @@ class HuggingFaceDatasetWriter(ParquetWriter):
             self._temporary_staging_closed = False
         super().write(document, rank=rank, **kwargs)
 
-    def upload_files(self, *filenames):
+    def upload_files(self, *filenames: str) -> None:
+        """Upload closed files, retaining failed uploads for the next close.
+
+        Args:
+            *filenames: Paths relative to the local staging directory.
+        """
+        self._pending_uploads.update(dict.fromkeys(filenames))
         if not self._repo_init:
             create_repo(self.dataset, private=self.private, repo_type="dataset", exist_ok=True)
             self._repo_init = True
@@ -131,14 +139,18 @@ class HuggingFaceDatasetWriter(ParquetWriter):
         logger.info(f"Uploading {','.join(filenames)} to the hub...")
         preupload_lfs_files(self.dataset, repo_type="dataset", additions=additions, revision=self.revision)
         logger.info(f"Upload of {','.join(filenames)} to the hub complete!")
+        # Record successful uploads before local cleanup, which can also fail.
+        self.operations.extend(additions)
+        for filename in filenames:
+            self._pending_uploads.pop(filename, None)
         if self.cleanup:
             for filename in filenames:
                 self.local_working_dir.rm(filename)
-        self.operations.extend(additions)
 
-    def close(self, rank: int = 0):
-        filelist = list(self.output_mg.get_open_files().keys())
+    def close(self, rank: int = 0) -> None:
+        self._pending_uploads.update(dict.fromkeys(self.output_mg.get_open_files()))
         super().close()
+        filelist = list(self._pending_uploads)
         if filelist:
             logger.info(f"Starting upload of {len(filelist)} files to {self.dataset}")
             self.upload_files(*filelist)
@@ -170,7 +182,7 @@ class HuggingFaceDatasetWriter(ParquetWriter):
             self._local_working_tmpdir.cleanup()
             self._temporary_staging_closed = True
 
-    def _on_file_switch(self, original_name, old_filename, new_filename):
+    def _on_file_switch(self, original_name: str, old_filename: str, new_filename: str) -> None:
         """
             Called when we are switching file from "old_filename" to "new_filename" (original_name is the filename
             without 000_, 001_, etc)

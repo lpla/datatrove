@@ -340,6 +340,7 @@ class TestDiskWriterRetries(unittest.TestCase):
         writer = object.__new__(HuggingFaceDatasetWriter)
         writer.output_mg = SimpleNamespace(get_open_files=lambda: {})
         writer.operations = []
+        writer._pending_uploads = {}
         writer.dataset = "org/repo"
         writer.revision = None
         writer.cleanup = True

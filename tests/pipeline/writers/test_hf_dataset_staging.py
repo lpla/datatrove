@@ -136,7 +136,11 @@ def test_explicit_staging_from_legacy_pickle(tmp_path: Path, monkeypatch: pytest
 
     def legacy_state(writer: hf.HuggingFaceDatasetWriter) -> dict[str, Any]:
         """Represent the previous writer's state, which had no temporary-directory owner."""
-        return {key: value for key, value in writer.__dict__.items() if key != "_local_working_tmpdir"}
+        return {
+            key: value
+            for key, value in writer.__dict__.items()
+            if key not in {"_local_working_tmpdir", "_pending_uploads"}
+        }
 
     original = hf.HuggingFaceDatasetWriter("org/test", local_working_dir=str(tmp_path), max_file_size=-1)
     with monkeypatch.context() as legacy:
@@ -358,3 +362,155 @@ def test_rotation_keeps_staging_until_commit(monkeypatch: pytest.MonkeyPatch) ->
     writer.close()
     assert uploaded == ["0", "1", "2"]
     assert not path.exists()
+
+
+@pytest.mark.parametrize("failure_step", ["create_repo", "preupload_lfs_files", "create_commit"])
+@pytest.mark.parametrize("temporary", [False, True])
+@pytest.mark.parametrize("cleanup", [False, True])
+@require_pyarrow
+def test_close_retries_failed_upload_or_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_step: str, temporary: bool, cleanup: bool
+) -> None:
+    """Repeated close failures retain files or uploaded operations until a successful commit."""
+    import pyarrow.parquet as pq
+
+    uploaded: list[dict[str, Any]] = []
+    committed: list[str] = []
+
+    def preupload(_dataset: str, additions: list[Any], **_kwargs: Any) -> None:
+        """Read the real staged documents on a successful upload."""
+        for addition in additions:
+            uploaded.extend(pq.read_table(addition.path_or_fileobj).to_pylist())
+
+    def commit(_dataset: str, operations: list[Any], **_kwargs: Any) -> None:
+        """Check that the recovered commit contains the file exactly once."""
+        committed.extend(operation.path_in_repo for operation in operations)
+
+    mocks = {
+        "create_repo": Mock(),
+        "preupload_lfs_files": Mock(side_effect=preupload),
+        "create_commit": Mock(side_effect=commit),
+    }
+    for name, mock in mocks.items():
+        monkeypatch.setattr(hf, name, mock)
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        """Raise a fresh error without retaining a writer traceback in the mock."""
+        raise RuntimeError("offline retry failure")
+
+    mocks[failure_step].side_effect = fail
+    options = {} if temporary else {"local_working_dir": str(tmp_path)}
+    writer = hf.HuggingFaceDatasetWriter("org/test", max_file_size=-1, cleanup=cleanup, **options)
+    staging = Path(writer.local_working_dir.path)
+    writer.write(Document(text="retry Árbol 🌱", id="fixture"))
+    for attempt in range(1, 3):
+        with pytest.raises(RuntimeError, match="offline retry failure"):
+            writer.close()
+        assert staging.is_dir()
+        assert (staging / "data/00000.parquet").is_file() is (failure_step != "create_commit" or not cleanup)
+        assert committed == []
+        assert mocks["create_commit"].call_count == (attempt if failure_step == "create_commit" else 0)
+
+    mocks[failure_step].side_effect = {"create_repo": None, "preupload_lfs_files": preupload, "create_commit": commit}[
+        failure_step
+    ]
+    writer.close()
+    assert [(row["id"], row["text"]) for row in uploaded] == [("fixture", "retry Árbol 🌱")]
+    assert committed == ["data/00000.parquet"]
+    assert mocks["preupload_lfs_files"].call_count == (3 if failure_step == "preupload_lfs_files" else 1)
+    assert writer.operations == []
+    assert staging.exists() is (not (temporary and cleanup))
+    assert (staging / "data/00000.parquet").is_file() is (not cleanup)
+
+
+@pytest.mark.parametrize("cleanup", [False, True])
+@require_pyarrow
+def test_close_retries_failed_rotation(monkeypatch: pytest.MonkeyPatch, cleanup: bool) -> None:
+    """Recover a closed rotated file alongside new output without reuploading earlier files."""
+    import pyarrow.parquet as pq
+
+    uploaded: list[str] = []
+    committed: list[str] = []
+    fail_rotation = False
+
+    def preupload(_dataset: str, additions: list[Any], **_kwargs: Any) -> None:
+        """Fail one rotation, then read all recovered files."""
+        if fail_rotation:
+            raise RuntimeError("offline rotation failure")
+        for addition in additions:
+            uploaded.extend(row["id"] for row in pq.read_table(addition.path_or_fileobj).to_pylist())
+
+    def commit(_dataset: str, operations: list[Any], **_kwargs: Any) -> None:
+        """Collect both earlier uploads and recovered files in one commit."""
+        committed.extend(operation.path_in_repo for operation in operations)
+
+    monkeypatch.setattr(hf, "create_repo", Mock())
+    monkeypatch.setattr(hf, "preupload_lfs_files", Mock(side_effect=preupload))
+    monkeypatch.setattr(hf, "create_commit", Mock(side_effect=commit))
+    writer = hf.HuggingFaceDatasetWriter("org/test", max_file_size=1, cleanup=cleanup)
+    staging = Path(writer.local_working_dir.path)
+    writer.write(Document(text="rotation 0", id="0"))
+    writer.write(Document(text="rotation 1", id="1"))
+    assert uploaded == ["0"]
+    fail_rotation = True
+    with pytest.raises(RuntimeError, match="offline rotation failure"):
+        writer.write(Document(text="rotation 2", id="2"))
+    assert (staging / "data/001_00000.parquet").is_file()
+    assert hf.create_commit.call_count == 0
+    fail_rotation = False
+    writer.write(Document(text="rotation 2", id="2"))
+    writer.close()
+    assert uploaded == ["0", "1", "2"]
+    assert committed == [f"data/{index:03d}_00000.parquet" for index in range(3)]
+    assert hf.preupload_lfs_files.call_count == 3
+    assert staging.exists() is (not cleanup)
+
+
+@pytest.mark.parametrize("failure_at", [1, 2])
+@require_pyarrow
+def test_close_keeps_uploaded_operations_when_cleanup_fails(monkeypatch: pytest.MonkeyPatch, failure_at: int) -> None:
+    """A partial local cleanup must not lose uploaded additions or require deleted files."""
+    import pyarrow.parquet as pq
+
+    uploaded: list[str] = []
+    committed: list[str] = []
+
+    def preupload(_dataset: str, additions: list[Any], **_kwargs: Any) -> None:
+        """Read both documents before the local cleanup starts."""
+        for addition in additions:
+            uploaded.extend(row["id"] for row in pq.read_table(addition.path_or_fileobj).to_pylist())
+
+    def commit(_dataset: str, operations: list[Any], **_kwargs: Any) -> None:
+        """Collect the uploaded additions preserved across cleanup failure."""
+        committed.extend(operation.path_in_repo for operation in operations)
+
+    monkeypatch.setattr(hf, "create_repo", Mock())
+    monkeypatch.setattr(hf, "preupload_lfs_files", Mock(side_effect=preupload))
+    monkeypatch.setattr(hf, "create_commit", Mock(side_effect=commit))
+    writer = hf.HuggingFaceDatasetWriter("org/test", output_filename="${rank}-${id}.parquet", max_file_size=-1)
+    staging = Path(writer.local_working_dir.path)
+    for index in range(2):
+        writer.write(Document(text=f"cleanup {index}", id=str(index)))
+    original_rm = writer.local_working_dir.rm
+    calls = 0
+
+    def rm(filename: str) -> None:
+        """Delete earlier files, then simulate a filesystem failure."""
+        nonlocal calls
+        calls += 1
+        if calls == failure_at:
+            raise OSError("offline cleanup failure")
+        original_rm(filename)
+
+    monkeypatch.setattr(writer.local_working_dir, "rm", rm)
+    with pytest.raises(OSError, match="offline cleanup failure"):
+        writer.close()
+    assert staging.is_dir()
+    assert len(list(staging.rglob("*.parquet"))) == 3 - failure_at
+    assert hf.create_commit.call_count == 0
+    writer.close()
+    assert uploaded == ["0", "1"]
+    assert committed == [f"00000-{index}.parquet" for index in range(2)]
+    assert hf.preupload_lfs_files.call_count == 1
+    assert hf.create_commit.call_count == 1
+    assert not staging.exists()
